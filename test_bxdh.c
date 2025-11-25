@@ -8,17 +8,13 @@
 #include <openssl/evp.h>
 #include <pthread.h>
 
-#define N 768
-#define ROOT 11 // Primitive root for Q=12289
-#define Q 12289
-// #define N 1280
-// #define Q 15361
-// #define ROOT 7 // Primitive root for Q=15361
-#define SEGMENT_SIZE 256
-#define NUM_SEGMENTS N/SEGMENT_SIZE
+#define N 512
+#define Q 18433
+#define ROOT 5
+#define LOGN 9
 #define ETA 2
-#define BITS_PER_COEFF 14 // For Q=12289/15361, we need 14 bits to represent coefficients
-#define COMPRESSED_POLY_SIZE ((N * BITS_PER_COEFF + 7) / 8)  // 1344 bytes for N=768,Q=12289/15361
+#define BITS_PER_COEFF 14
+#define COMPRESSED_POLY_SIZE ((N * BITS_PER_COEFF + 7) / 8)
 #define BARRETT_SHIFT 48
 #define bits_needed (2 * ETA * N)
 #define byte_len ((bits_needed + 7) / 8)
@@ -31,20 +27,14 @@ typedef enum {
     ERROR_CRYPTO_OPERATION = -3
 } result_t;
 
-
-
 // Function declarations
 void precompute_roots();
 int64_t mod_q(int64_t x);
 int64_t pow_mod(int64_t base, int64_t exp);
-int bitrev(int x);
-void ntt_256(int64_t *a);
-void intt_256(int64_t *a);
+int bitrev(int x, int logn);
 void ntt_512(int64_t *a);
 void intt_512(int64_t *a);
-void split_poly(const int64_t *a, int64_t segments[NUM_SEGMENTS][256]);
-void combine_poly(const int64_t segments[NUM_SEGMENTS][256], int64_t *result);
-void poly_mul(const int64_t *a, const int64_t *b, int64_t *c);
+void poly_mul_512(const int64_t *a, const int64_t *b, int64_t *c);
 void generate_random_poly(int64_t *poly);
 
 // CBD2 related functions
@@ -54,17 +44,18 @@ void prg_gaussian(const uint8_t *seed, int64_t *result);
 void poly_add_inplace(int64_t *a, const int64_t *b);
 void poly_sub_inplace(int64_t *a, const int64_t *b);
 
-// Precomputation struct
+// Precomputation struct for 512-point NTT
 typedef struct {
-    int64_t a_ntt[NUM_SEGMENTS][512];
+    int64_t a_ntt[512];  // Precomputed NTT form of polynomial a
     int64_t a_original[N];
     int64_t inv_N_512;
-    int64_t inv_N_256;
 } precomputed_a_t;
 
-// Precomputed twiddle factors
-static int64_t Q_2_256_POW_MOD;
+// Precomputed twiddle factors for 512-point NTT
+static int64_t roots_512_layered[LOGN][256];
+static int64_t inv_roots_512_layered[LOGN][256];
 static int64_t Q_2_512_POW_MOD;
+
 // Batch random number generation
 #define BATCH_SIZE 65536
 static uint8_t rand_batch[BATCH_SIZE];
@@ -73,54 +64,49 @@ static pthread_mutex_t batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ==================== Optimization utility functions ====================
 // Precompute Barrett reduction parameters
-static const int64_t BARRETT_M = ((1LL <<  BARRETT_SHIFT) + Q - 1) / Q;
+static const int64_t BARRETT_M = ((1LL << BARRETT_SHIFT) + Q - 1) / Q;
+
 // Barrett reduction - fast modular operation
 int64_t mod_q(int64_t x) {
-    int64_t q = (x * BARRETT_M) >> BARRETT_SHIFT;
-    int64_t r = x - q * Q;
-    r -= Q;
+    int64_t q = 0, r = 0;
+    q = (x * BARRETT_M) >> BARRETT_SHIFT;
+    r = x - q * Q - Q;
     r += (r >> 63) & Q;
     return r;
 }
 
-
 // Fast modular exponentiation
-
 int64_t pow_mod(int64_t base, int64_t exp) {
     int64_t result = 1;
-    base = base % Q;
+    base = mod_q(base);
     
     // Handle special case of exp=0 (constant time)
-    int64_t is_zero_exp = (exp == 0) - 1;  // If exp=0, then 0xFFFFFFFF...
-    result = (result & ~is_zero_exp) | (1 & is_zero_exp);  // Return 1 when exp=0
+    int64_t is_zero_exp = (exp == 0) - 1;
+    result = (result & ~is_zero_exp) | (1 & is_zero_exp);
     
     while (exp > 0) {
-        // Constant time conditional multiplication
         int should_multiply = (exp & 1);
-        int64_t temp = (result * base) % Q;
+        int64_t temp = mod_q((__int128)result * base);
         
-        // Constant time selection: use temp if should_multiply, otherwise keep result
         result = (temp & -should_multiply) | (result & ~(-should_multiply));
-        
-        base = (base * base) % Q;
+        base = mod_q((__int128)base * base);
         exp >>= 1;
     }
     return result;
 }
-                                            
+
 int64_t add_mod_q(int64_t x, int64_t y) {
     int64_t r = x + y - Q;
-    // if (r < 0) then r += Q;
     r += (r >> 63) & Q;
     return r;
 }
 
 int64_t sub_mod_q(int64_t x, int64_t y) {
     int64_t r = x - y;
-    // if (r < 0) then r += Q;
     r += (r >> 63) & Q;
     return r;
 }
+
 // Batch secure random number generation
 int batched_secure_random(uint8_t *buf, size_t len) {
     if (len > BATCH_SIZE / 2) {
@@ -145,76 +131,65 @@ int batched_secure_random(uint8_t *buf, size_t len) {
 }
 
 // ==================== NTT related functions ====================
-static int64_t roots_256_layered[7][128];  
-static int64_t inv_roots_256_layered[7][128];
-static int64_t roots_512_layered[9][256];  
-static int64_t inv_roots_512_layered[9][256];
+
 void butterfly(int64_t *a, int64_t *b, int64_t w) {
     int64_t u = *a;
-    int64_t v = mod_q((__int128)*b * w);
+    int64_t v = mod_q((__int128)(*b) * w);
     *a = add_mod_q(u, v);
     *b = sub_mod_q(u, v);
 }
 
-void precompute_roots() {
-    int64_t g = ROOT;
-    
+// Bit reversal function
+int bitrev(int x, int logn) {
+    int r = 0;
+    for (int i = 0; i < logn; ++i) {
+        r = (r << 1) | (x & 1u);
+        x >>= 1;
+    }
+    return r;
+}
 
-    int64_t w256 = pow_mod(g, (Q-1)/512);  
-    int layer_256 = 0;
-    for (int len = 2; len <= 256; len <<= 1, layer_256++) {
-        int step = 256 / len;
-        int64_t w_len = pow_mod(w256, step);
-        
-        int64_t w_current = 1;
-        for (int j = 0; j < len/2; j++) {
-            roots_256_layered[layer_256][j] = w_current;
-            inv_roots_256_layered[layer_256][j] = pow_mod(w_current, Q-2);
-            w_current = mod_q(w_current * w_len);
+// Bit-reverse permutation
+void bitrev_permute(int64_t *a, int n, int logn) {
+    for (int i = 0; i < n; ++i) {
+        int j = bitrev(i, logn);
+        if (j > i) {
+            int64_t t = a[i];
+            a[i] = a[j];
+            a[j] = t;
         }
     }
-    
+}
 
-    int64_t w512 = pow_mod(g, (Q-1)/512);  
+void precompute_roots() {
+    int64_t g = ROOT;
+
+    /* 512-point NTT roots */
+    int64_t w512 = pow_mod(g, (Q - 1) / 512);
     int layer_512 = 0;
+    
     for (int len = 2; len <= 512; len <<= 1, layer_512++) {
         int step = 512 / len;
         int64_t w_len = pow_mod(w512, step);
-        
         int64_t w_current = 1;
-        for (int j = 0; j < len/2; j++) {
-            roots_512_layered[layer_512][j] = w_current;
-            inv_roots_512_layered[layer_512][j] = pow_mod(w_current, Q-2);
-            w_current = mod_q(w_current * w_len);
-        }
-    }
-    Q_2_256_POW_MOD = pow_mod(256, Q-2);
-    Q_2_512_POW_MOD = pow_mod(512, Q-2);
-}
-
-
-void ntt_256(int64_t *a) {
-    int layer = 0;
-    for (int len = 2; len <= 256; len <<= 1, layer++) {
-        int half = len >> 1;
         
-        for (int i = 0; i < 256; i += len) {
-            const int64_t *w_ptr = roots_256_layered[layer];
-            int64_t *a_ptr = a + i;
-            int64_t *b_ptr = a_ptr + half;
-            
-            for (int j = 0; j < half; j++) {
-                butterfly(a_ptr + j, b_ptr + j, w_ptr[j]);
-            }
+        for (int j = 0; j < len / 2; j++) {
+            roots_512_layered[layer_512][j] = w_current;
+            inv_roots_512_layered[layer_512][j] = pow_mod(w_current, Q - 2);
+            w_current = mod_q((__int128)w_current * w_len);
         }
     }
+
+    Q_2_512_POW_MOD = pow_mod(512, Q - 2);
 }
 
 void ntt_512(int64_t *a) {
+    // Permute to bit-reversed order
+    bitrev_permute(a, 512, LOGN);
+
     int layer = 0;
     for (int len = 2; len <= 512; len <<= 1, layer++) {
         int half = len >> 1;
-        
         for (int i = 0; i < 512; i += len) {
             const int64_t *w_ptr = roots_512_layered[layer];
             int64_t *a_ptr = a + i;
@@ -227,36 +202,10 @@ void ntt_512(int64_t *a) {
     }
 }
 
-
-void intt_256(int64_t *a) {
-    int layer = 6;  
-    for (int len = 256; len > 1; len >>= 1, layer--) {
-        int half = len >> 1;
-        
-        for (int i = 0; i < 256; i += len) {
-            const int64_t *w_ptr = inv_roots_256_layered[layer];
-            int64_t *a_ptr = a + i;
-            int64_t *b_ptr = a_ptr + half;
-            
-            for (int j = 0; j < half; j++) {
-                int64_t u = a_ptr[j];
-                int64_t v = b_ptr[j];
-                a_ptr[j] = mod_q(u + v);
-                b_ptr[j] = mod_q((u - v) * w_ptr[j]);
-            }
-        }
-    }
-
-    for (int i = 0; i < 256; i++) {
-        a[i] = mod_q(a[i] * Q_2_256_POW_MOD);
-    }
-}
-
 void intt_512(int64_t *a) {
-    int layer = 8;  
+    int layer = LOGN - 1;
     for (int len = 512; len > 1; len >>= 1, layer--) {
         int half = len >> 1;
-        
         for (int i = 0; i < 512; i += len) {
             const int64_t *w_ptr = inv_roots_512_layered[layer];
             int64_t *a_ptr = a + i;
@@ -266,164 +215,86 @@ void intt_512(int64_t *a) {
                 int64_t u = a_ptr[j];
                 int64_t v = b_ptr[j];
                 a_ptr[j] = mod_q(u + v);
-                b_ptr[j] = mod_q((u - v) * w_ptr[j]);
+                b_ptr[j] = mod_q((__int128)(u - v) * w_ptr[j]);
             }
         }
     }
     
+    // Scale by 1/N
     for (int i = 0; i < 512; i++) {
-        a[i] = mod_q(a[i] * Q_2_512_POW_MOD);
+        a[i] = mod_q((__int128)a[i] * Q_2_512_POW_MOD);
     }
+    
+    // Restore natural order
+    bitrev_permute(a, 512, LOGN);
 }
+
 // ==================== Polynomial operations ====================
 
-// Polynomial splitting
-void split_poly(const int64_t *a, int64_t segments[NUM_SEGMENTS][256]) {
-    // Use memcpy for batch copying
-    for(int i=0;i<NUM_SEGMENTS;i++){
-        memcpy(segments[i], a+256*i, 256 * sizeof(int64_t));
+// Optimized 512-point polynomial multiplication using NTT
+void poly_mul_512(const int64_t *a, const int64_t *b, int64_t *c) {
+    int64_t A[512], B[512];
+    
+    // Copy and compute NTT
+    memcpy(A, a, sizeof(int64_t) * 512);
+    memcpy(B, b, sizeof(int64_t) * 512);
+    
+    ntt_512(A);
+    ntt_512(B);
+    
+    // Pointwise multiplication
+    for (int i = 0; i < 512; i++) {
+        A[i] = mod_q((__int128)A[i] * B[i]);
     }
-}
-
-// Optimized combination function
-void combine_poly(const int64_t segments[NUM_SEGMENTS][256], int64_t *result) {
-    for (int i = 0; i < NUM_SEGMENTS; i++) {
-        for (int j = 0; j < 256; j += 4) {
-            result[i*256 + j]   = segments[i][j];
-            result[i*256 + j+1] = segments[i][j+1];
-            result[i*256 + j+2] = segments[i][j+2];
-            result[i*256 + j+3] = segments[i][j+3];
-        }
-    }
-}
-
-// Optimized NUM_SEGMENTS×256-point negacyclic convolution
-void poly_mul(const int64_t *a, const int64_t *b, int64_t *c) {
-    int64_t A_segs[NUM_SEGMENTS][256];
-    int64_t B_segs[NUM_SEGMENTS][256];
-    split_poly(a, A_segs);
-    split_poly(b, B_segs);
-
-    // NTT each segment (zero-padded to 512)
-    int64_t A_ntt[NUM_SEGMENTS][512], B_ntt[NUM_SEGMENTS][512];
-    for (int r = 0; r < NUM_SEGMENTS; ++r) {
-        memcpy(A_ntt[r], A_segs[r], 256 * sizeof(int64_t));
-        memset(A_ntt[r] + 256, 0, 256 * sizeof(int64_t));
-        ntt_512(A_ntt[r]);
-    }
-    for (int s = 0; s < NUM_SEGMENTS; ++s) {
-        memcpy(B_ntt[s], B_segs[s], 256 * sizeof(int64_t));
-        memset(B_ntt[s] + 256, 0, 256 * sizeof(int64_t));
-        ntt_512(B_ntt[s]);
-    }
-
-    __int128 acc[N] = {0};
-    int64_t product[512];
-
-    for (int r = 0; r < NUM_SEGMENTS; ++r) {
-        for (int s = 0; s < NUM_SEGMENTS; ++s) {
-            for (int i = 0; i < 512; ++i) {
-                product[i] = mod_q((__int128)A_ntt[r][i] * B_ntt[s][i]);
-            }
-            intt_512(product);
-
-            int base = (r + s) * 256;
-            for (int k = 0; k < 511; ++k) {
-                int total_deg = base + k;
-                int is_high = (total_deg >= N);        // 0 / 1
-                int idx = total_deg - (N & -is_high);  // if is_high==1 → total_deg-N, otherwise total_deg
-                int64_t sign = 1 - 2 * is_high;        // if is_high==1 → -1, otherwise +1
-
-                acc[idx] += (__int128)product[k] * sign;
-            }
-        }
-    }
-
-    for (int i = 0; i < N; ++i)
-        c[i] = mod_q(acc[i]);
+    
+    // Inverse NTT
+    intt_512(A);
+    
+    // Copy result
+    memcpy(c, A, sizeof(int64_t) * 512);
 }
 
 // ==================== Precomputation optimization ====================
 
-// Precomputation function
+// Precomputation function for 512-point NTT
 void precompute_a_ntt(int64_t *a, precomputed_a_t *precomputed) {
-    int64_t A_segs[NUM_SEGMENTS][256];
-    split_poly(a, A_segs);
-    
-    for (int i = 0; i < NUM_SEGMENTS; i++) {
-        int64_t padded[512] = {0};
-        
-        // Pad to 512 points
-        for (int j = 0; j < 256; j++) {
-            padded[j] = A_segs[i][j];
-        }
-        
-        // Compute NTT
-        ntt_512(padded);
-        
-        // Store NTT result
-        memcpy(precomputed->a_ntt[i], padded, sizeof(int64_t) * 512);
-    }
-    
-    // Save original a and precomputed scaling factors
+    // Copy original polynomial
     memcpy(precomputed->a_original, a, sizeof(int64_t) * N);
-    precomputed->inv_N_512 = Q_2_512_POW_MOD ;
-    precomputed->inv_N_256 = Q_2_256_POW_MOD;
+    
+    // Pad to 512 points if necessary (for N=512, no padding needed)
+    int64_t padded[512];
+    memcpy(padded, a, sizeof(int64_t) * 512);
+    
+    // Compute NTT
+    ntt_512(padded);
+    
+    // Store NTT result
+    memcpy(precomputed->a_ntt, padded, sizeof(int64_t) * 512);
+    
+    // Save scaling factor
+    precomputed->inv_N_512 = Q_2_512_POW_MOD;
 }
 
 // Optimized polynomial multiplication using precomputed NTT
 void poly_mul_precomputed(const precomputed_a_t *precomputed, const int64_t *b, int64_t *c) {
-    int64_t B_segs[NUM_SEGMENTS][256];
-    split_poly(b, B_segs);
-
-    // 1) NTT each B segment in-place (zero-pad to 512)
-    static int64_t b_ntt[NUM_SEGMENTS][512];
-    for (int s = 0; s < NUM_SEGMENTS; ++s) {
-        // copy and zero upper half
-        memcpy(b_ntt[s], B_segs[s], 256 * sizeof(int64_t));
-        memset(b_ntt[s] + 256, 0, 256 * sizeof(int64_t));
-        ntt_512(b_ntt[s]);
-    }
-
-    // 2) Accumulator must be wide to avoid overflow
-    static __int128 acc_static[N];  // static to avoid large stack usage
-    for (int i = 0; i < N; ++i) acc_static[i] = 0;
-
+    int64_t B_ntt[512];
+    
+    // Copy and compute NTT of b
+    memcpy(B_ntt, b, sizeof(int64_t) * 512);
+    ntt_512(B_ntt);
+    
+    // Pointwise multiplication in frequency domain
     int64_t product[512];
-
-    for (int r = 0; r < NUM_SEGMENTS; ++r) {
-        for (int s = 0; s < NUM_SEGMENTS; ++s) {
-            // pointwise multiply in freq domain -> product
-            for (int i = 0; i < 512; ++i) {
-                // mod_q should accept __int128 / or we cast inside
-                product[i] = mod_q((__int128)precomputed->a_ntt[r][i] * (__int128)b_ntt[s][i]);  
-            }
-
-            // inverse NTT back to time domain (length 512)
-            intt_512(product);
-
-            // fold linear convolution (length 511) into acc
-            int shift_blocks = r + s;
-            for (int k = 0; k < 511; ++k) {
-                int total_deg = 256 * shift_blocks + k;
-                // compute wrap and target idx branchlessly (total_deg and N public)
-                int need_wrap = (total_deg >= N);           // 0 or 1
-                int target_idx = total_deg - need_wrap * N; // if need_wrap then subtract N
-                int sign = 1 - 2 * need_wrap;               // 1 or -1
-
-                // Use product[k] directly (no extra masking). product[k] in [0,Q)
-                acc_static[target_idx] += (__int128)product[k] * (__int128)sign;
-            }
-        }
+    for (int i = 0; i < 512; i++) {
+        product[i] = mod_q((__int128)precomputed->a_ntt[i] * B_ntt[i]);
     }
-
-    // 3) final reduction into c[i] in [0, Q)
-    for (int i = 0; i < N; ++i) {
-        c[i] = mod_q(acc_static[i]);
-    }
+    
+    // Inverse NTT back to time domain
+    intt_512(product);
+    
+    // Copy result
+    memcpy(c, product, sizeof(int64_t) * 512);
 }
-
-// ==================== Polynomial arithmetic operations ====================
 
 // Polynomial addition (in-place operation)
 void poly_add_inplace(int64_t *a, const int64_t *b) {
@@ -467,25 +338,26 @@ void poly_sub_q(const int64_t *a, const int64_t *b, int64_t *c) {
 
 // ==================== Random polynomial generation ====================
 
-// Generate random polynomial
 void generate_random_poly(int64_t *poly) {
     uint8_t buf[N * 2];
-    if (batched_secure_random(buf, sizeof(buf)) != SUCCESS) {
-        fprintf(stderr, "Error: RAND_bytes failed.\n");
-        exit(1);
-    }
-
     int filled = 0;
-    for (int i = 0; filled < N; i += 2) {
-        uint16_t r = ((uint16_t)buf[i] << 8) | buf[i + 1];
-        if (r < Q) {
-            poly[filled++] = r;
+
+    while (filled < N) {
+        if (batched_secure_random(buf, sizeof(buf)) != SUCCESS) {
+            fprintf(stderr, "Error: RAND_bytes failed.\n");
+            exit(1);
+        }
+
+        for (int i = 0; i + 1 < (int)sizeof(buf) && filled < N; i += 2) {
+            uint16_t r = ((uint16_t)buf[i] << 8) | buf[i + 1];
+            if (r < Q) {
+                poly[filled++] = r;
+            }
         }
     }
 }
 
 // Bit counting helper function
-
 int bit_count_u32(uint32_t x) {
     x = x - ((x >> 1) & 0x55555555);
     x = (x & 0x33333333) + ((x >> 2) & 0x33333333);
@@ -518,33 +390,27 @@ int shake256(const uint8_t *input, size_t input_len,
     return SUCCESS;
 }
 
-const uint32_t mask = (1u << ETA) - 1u;
-const uint64_t extract_mask = (1ULL << (2 * ETA)) - 1ULL;
-// CBD implementation
-void cbd_eta(const uint8_t *input_bytes, int64_t *coeffs) {
-    uint64_t buf = 0;
-    int buf_bits = 0;
-    int byte_index = 0;
+// CBD implementation for eta=2
+void cbd_eta(const uint8_t *buf, int64_t *r) {
+    for (int i = 0; i < N / 8; i++) {
+        uint64_t t = 0;
+        // Read 4 bytes (8 coefficients = 32 bits)
+        for (int j = 0; j < 4; j++)
+            t |= ((uint64_t)buf[4 * i + j]) << (8 * j);
 
-    // Precompute masks
+        // Compute a,b popcount
+        uint64_t d = t & 0x55555555ULL;       // Extract even bits
+        d += (t >> 1) & 0x55555555ULL;        // Extract odd bits and add
 
-    for (int i = 0; i < N; i++) {
-        // Fill buffer
-        while (buf_bits < 2 * ETA) {
-            buf |= ((uint64_t)input_bytes[byte_index++]) << buf_bits;
-            buf_bits += 8;
+        // Each 2 bits in d encode the difference a-b
+        for (int j = 0; j < 8; j++) {
+            uint64_t a = (d >> (4 * j)) & 0x3;      // bits 0-1
+            uint64_t b = (d >> (4 * j + 2)) & 0x3;  // bits 2-3
+            r[8 * i + j] = (int64_t)(a - b);
         }
-
-        // Extract and compute
-        uint32_t x = (uint32_t)(buf & extract_mask);
-        int a = bit_count_u32(x & mask);
-        int b = bit_count_u32((x >> ETA) & mask);
-        coeffs[i] = a - b;
-
-        buf >>= (2 * ETA);
-        buf_bits -= (2 * ETA);
     }
 }
+
 // Generate Gaussian distribution polynomial
 void prg_gaussian(const uint8_t *seed, int64_t *result) {
     uint8_t *random_bytes = (uint8_t *)malloc(byte_len);
@@ -557,20 +423,20 @@ void prg_gaussian(const uint8_t *seed, int64_t *result) {
     free(random_bytes);
 }
 
-// Optimized s and b generation function (no dynamic memory allocation)
+// Optimized s and b generation function using 512-point NTT
 void generate_s_b_gaussian_optimized(const uint8_t seed32[32], const precomputed_a_t *precomputed, int64_t *s, int64_t *b) {
-    uint8_t seed_s[33], seed_e[33];
+    uint8_t seed_s[33] = {0}, seed_e[33] = {0};
     memcpy(seed_s, seed32, 32);
     memcpy(seed_e, seed32, 32);
     seed_s[32] = 's';
     seed_e[32] = 'e';
 
-    int64_t e[N];  // Use stack memory
+    int64_t e[N] = {0};
 
     prg_gaussian(seed_s, s);
     prg_gaussian(seed_e, e);
 
-    // Directly compute into b
+    // Directly compute into b using precomputed NTT
     poly_mul_precomputed(precomputed, s, b);
     
     // Add error term in-place: b = b + 2e
@@ -582,7 +448,7 @@ void generate_s_b_gaussian_optimized(const uint8_t seed32[32], const precomputed
 // ==================== Key generation ====================
 
 result_t keygen(const precomputed_a_t *precomputed, int64_t *s, int64_t *b) {
-    uint8_t seed[32];
+    uint8_t seed[32] = {0};
     if (batched_secure_random(seed, 32) != SUCCESS) {
         return ERROR_RANDOM_FAILED;
     }
@@ -592,46 +458,84 @@ result_t keygen(const precomputed_a_t *precomputed, int64_t *s, int64_t *b) {
 
 // ==================== Helper functions ====================
 
-int64_t mod2(int64_t x, int64_t w) {
-    int64_t tmp = (x + w * ((Q - 1) / 2)) % Q;
-    // Constant time handling of negative numbers
-    int64_t is_negative = tmp >> 63;
-    tmp += Q & is_negative;
-    return tmp & 1;
+#include <inttypes.h>
+#include <stdbool.h>
+
+// canonical modular reduction to [0, Q-1]
+
+// centered: map canonical [0, Q-1] -> symmetric interval
+// tie_to_negative: when ux == Q/2 and Q is even, maps(true => to ux-Q)
+static inline int64_t centered_from_u64(uint64_t ux, bool tie_to_negative) {
+    uint64_t half = (uint64_t)(Q / 2); // floor(Q/2)
+    if (ux > half) {
+        return (int64_t)((int64_t)ux - (int64_t)Q); // if negative
+    }
+    if (ux == half && (Q % 2 == 0) && tie_to_negative) {
+        // map bound to negative
+        return (int64_t)((int64_t)ux - (int64_t)Q);
+    }
+    //otherwise
+    return (int64_t)ux;
 }
 
-int64_t sig_0(int64_t x) {
-    int64_t bound = Q / 4;
-    int64_t mask1 = x >> 63;           
-    int64_t absx = (x ^ mask1) - mask1; 
-    int64_t diff = absx - bound;     
-    uint64_t over = (uint64_t)(diff) >> 63;  
-    return (int64_t)(1 - over); 
+// wrapper: accepts possibly not-canonical x
+static inline int64_t centered(int64_t x, bool tie_to_negative) {
+    uint64_t ux = mod_q(x);
+    return centered_from_u64(ux, tie_to_negative);
 }
 
-int64_t sig_1(int64_t x) {
-    int64_t bound = Q / 4+1;
-    int64_t mask1 = x >> 63;          
-    int64_t absx = (x ^ mask1) - mask1; 
-    int64_t diff = absx - bound;     
-    uint64_t over = (uint64_t)(diff) >> 63;  
-    return (int64_t)(1 - over); 
+// sig_0: threshold based on q/4
+// t = floor(Q/4).
+// when |x| > t  return 1.
+// when |x| < = t return 0 
+static inline int64_t sig_0(int64_t x, bool tie_to_negative) {
+    int64_t cx = centered(x, tie_to_negative); // in symmetric interval
+    uint64_t t = (uint64_t)(Q / 4);            // floor
+    int64_t mask11 = cx >> 63;                   // sign mask
+    uint64_t absx = (uint64_t)((cx ^ mask11) - mask11);
+    // return 1 iff absx > t
+    if (absx > t) return 1;
+    // tie or small -> 0
+    return 0;
+}
+
+// sig_1: similar but threshold = floor(Q/4)+1
+static inline int64_t sig_1(int64_t x, bool tie_to_negative) {
+    int64_t cx = centered(x, tie_to_negative);
+    uint64_t t = (uint64_t)(Q / 4) + 1;
+    int64_t mask11 = cx >> 63;
+    uint64_t absx = (uint64_t)((cx ^ mask11) - mask11);
+    return (absx > t) ? 1 : 0;
+}
+
+// mod2: produce the recovered bit using w (hint in {0,1})
+// Idea: apply same shift used in scheme, then take parity of centered representative.
+// Implementation avoids UB: convert to canonical, then to centered int64_t, then parity via uint64_t.
+static inline int64_t mod2(int64_t x, int64_t w, bool tie_to_negative) {
+    // Typical scheme uses adding w * (q/2) (or (q-1)/2 in older buggy code).
+    // Use exact q/2 (floor) here for consistency (both sides must use same).
+    int64_t add = (int64_t)w * (int64_t)(Q / 2); // w is 0 or 1
+    int64_t shifted = x + add;
+    // compute centered representative
+    int64_t c = centered(shifted, tie_to_negative); // c possibly negative
+    uint64_t uc = (uint64_t)c; // two's complement representation; parity ok
+    return (int64_t)(uc & 1u);
 }
 
 // ==================== RLDH protocol implementation ====================
-
+const bool TIE_TO_NEGATIVE = true;
 void astRLDH(const int64_t *pk_a, const int64_t *sk_b, int64_t *htb, int64_t *dhb) {
-    uint8_t seed[32];
-    if (batched_secure_random(seed, 32) != SUCCESS) {
+    uint8_t seed[33] = {0};
+    if (batched_secure_random(seed, 33) != SUCCESS) {
         fprintf(stderr, "Random generation failed!\n");
         exit(1);
     }
 
-    int64_t e[N], tmp[N];
+    int64_t e[N] = {0}, tmp[N] = {0};
     prg_gaussian(seed, e);
 
-    // tmp = pk_a * sk_b (mod q)
-    poly_mul(pk_a, sk_b, tmp);
+    // tmp = pk_a * sk_b (mod q) using 512-point NTT
+    poly_mul_512(pk_a, sk_b, tmp);
     
     // tmp = tmp + 2e mod q
     for (int i = 0; i < N; i++) {
@@ -639,50 +543,40 @@ void astRLDH(const int64_t *pk_a, const int64_t *sk_b, int64_t *htb, int64_t *dh
     }
 
     // Set kb to centered modulo (q)
-    int64_t kb[N];
-    for (int i = 0; i < N; i++) {
-        kb[i] = tmp[i];
-        int64_t condition = (kb[i] > (Q - 1) / 2);
-        kb[i] = kb[i] - condition * (Q - 1) + (condition & (kb[i] == Q - 1));
-    }
+    int64_t kb[N] = {0};
 
-    // Hint and derived bits
-    // uint8_t random_bits[96];
-    // if (batched_secure_random(random_bits, 96) != SUCCESS) {
-    //     fprintf(stderr, "Random generation failed!\n");
-    //     exit(1);
-    // }
 
-    for (int i = 0; i < N; i++) {
-        // int byte_index = i / 8;
-        // int bit_index = i % 8;
-        // int alea = (random_bits[byte_index] >> bit_index) & 1;
-        
-        // int64_t sig = alea ? sig_0(kb[i], q) : sig_1(kb[i], q);
-        int64_t sig=sig_0(kb[i]);
-        htb[i] = sig;
-        dhb[i] = mod2(kb[i], htb[i]);
-    }
+for (int i = 0; i < N; i++) {
+    // ensure canonical representative
+    tmp[i] = (int64_t)mod_q(tmp[i]);
+    kb[i] = centered(tmp[i], TIE_TO_NEGATIVE);
+}
+
+for (int i = 0; i < N; i++) {
+    int64_t sig = sig_0(kb[i], TIE_TO_NEGATIVE);
+    htb[i] = sig;
+    dhb[i] = mod2(kb[i], htb[i], TIE_TO_NEGATIVE);
+}
 }
 
 void recRLDH(const int64_t *pk_b, const int64_t *sk_a, const int64_t *htb, int64_t *dha) {
-    int64_t tmp[N];
-    poly_mul(pk_b, sk_a, tmp);
+    int64_t tmp[N] = {0};
+    poly_mul_512(pk_b, sk_a, tmp);
 
-    int64_t ka[N];
-    for (int i = 0; i < N; i++) {
-        ka[i] = tmp[i];
-        int64_t condition = (ka[i] > (Q - 1) / 2);
-        ka[i] = ka[i] - condition * (Q - 1) + (condition & (ka[i] == Q - 1));
-    }
+    int64_t ka[N] = {0};
+for (int i = 0; i < N; i++) {
+    tmp[i] = (int64_t)mod_q(tmp[i]);
+    ka[i] = centered(tmp[i], TIE_TO_NEGATIVE);
+}
 
-    for (int i = 0; i < N; i++) {
-        dha[i] = mod2(ka[i], htb[i]);
-    }
+for (int i = 0; i < N; i++) {
+    dha[i] = mod2(ka[i], htb[i], TIE_TO_NEGATIVE);
+}
 }
 
 // ==================== Polynomial compression ====================
 static const uint8_t BIT_MASKS[9] = {0, 1, 3, 7, 15, 31, 63, 127, 255};
+
 void poly_to_compressed_bytes(const int64_t *poly, int n, uint8_t *bytes) {
     uint64_t buffer = 0;
     int bit_count = 0;
@@ -703,7 +597,6 @@ void poly_to_compressed_bytes(const int64_t *poly, int n, uint8_t *bytes) {
     if (bit_count > 0) {
         bytes[byte_pos] = (buffer << (8 - bit_count)) & BIT_MASKS[bit_count];
     }
-
 }
 
 void compressed_bytes_to_poly(const uint8_t *bytes, int n, int64_t *poly) {
@@ -713,18 +606,15 @@ void compressed_bytes_to_poly(const uint8_t *bytes, int n, int64_t *poly) {
     const int bits_per_coeff = BITS_PER_COEFF;
     
     for (int i = 0; i < n; i++) {
-        // Ensure enough bits in buffer
         while (bits_in_buffer < bits_per_coeff) {
             bit_buffer = (bit_buffer << 8) | bytes[byte_index++];
             bits_in_buffer += 8;
         }
         
-        // Extract coefficient
         int shift = bits_in_buffer - bits_per_coeff;
         uint16_t coeff = (bit_buffer >> shift) & ((1 << bits_per_coeff) - 1);
         poly[i] = coeff;
         
-        // Update buffer
         bits_in_buffer -= bits_per_coeff;
         bit_buffer &= (1ULL << bits_in_buffer) - 1;
     }
@@ -739,7 +629,7 @@ int PRF_2(const int64_t dhb[N], const uint8_t *sid, size_t sid_len,
     poly_to_compressed_bytes(dhb, N, dhb_compressed);
     
     size_t data_len = COMPRESSED_POLY_SIZE + sid_len;
-    uint8_t data[data_len+ 3];
+    uint8_t data[data_len + 3];
     
     memcpy(data, dhb_compressed, COMPRESSED_POLY_SIZE);
     memcpy(data + COMPRESSED_POLY_SIZE, sid, sid_len);
@@ -789,13 +679,32 @@ size_t build_session_id(const int64_t lpk_a[N], const int64_t spk_a[N],
     return offset;
 }
 
+size_t build_session_id1(const int64_t sum_pk_a[N], const int64_t sum_pk_b[N],
+                       uint8_t *sid_output) {
+    size_t offset = 0;
+    
+    memcpy(sid_output + offset, "A", 1);
+    offset += 1;
+    
+    memcpy(sid_output + offset, "B", 1);
+    offset += 1;
+    
+    poly_to_compressed_bytes(sum_pk_a, N, sid_output + offset);
+    offset += COMPRESSED_POLY_SIZE;
+    
+    poly_to_compressed_bytes(sum_pk_b, N, sid_output + offset);
+    offset += COMPRESSED_POLY_SIZE;
+    
+    return offset;
+}
+
 // ==================== AES-GCM encryption/decryption ====================
 
 int aes_gcm_encrypt(const uint8_t *key, size_t key_len,
-                   const uint8_t *iv, size_t iv_len,
+                   const uint8_t *iv,
                    const uint8_t *aad, size_t aad_len,
                    const uint8_t *plaintext, size_t plaintext_len,
-                   uint8_t *ciphertext, size_t ciphertext_len) {
+                   uint8_t *ciphertext) {
     
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     int len, ciphertext_len_out;
@@ -835,10 +744,10 @@ int aes_gcm_encrypt(const uint8_t *key, size_t key_len,
 }
 
 int aes_gcm_decrypt(const uint8_t *key, size_t key_len,
-                   const uint8_t *iv, size_t iv_len,
+                   const uint8_t *iv,
                    const uint8_t *aad, size_t aad_len,
                    uint8_t *ciphertext, size_t ciphertext_len,  
-                   uint8_t *plaintext, size_t plaintext_len) {
+                   uint8_t *plaintext) {
     
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     int len, plaintext_len_out;
@@ -883,27 +792,85 @@ uint64_t rdtsc() {
     return ((uint64_t)hi << 32) | lo;
 }
 
-void test_dh_keygen() {
-    srand(time(NULL));
+
+void test_keygen() {
+    int64_t a[N] = {0};
+    generate_random_poly(a);
     
-    int64_t a[N];
+    precomputed_a_t precomputed;
+    precompute_a_ntt(a, &precomputed);
+
+    int64_t s[N] = {0}, b[N] = {0};
+    uint64_t total_cycles = 0;
+    for (int i = 0; i < 1000; i++) {
+        uint64_t start = rdtsc();
+        keygen(&precomputed, s, b);
+        uint64_t end = rdtsc();
+        total_cycles += (end - start);
+    }
+    
+    printf("Average keygen cycles: %.2f\n", (double)total_cycles / 1000);
+    printf("Average keygen cycles: %.3f Mcycles\n", (double)total_cycles / 1000 / 1e6);
+}
+
+
+
+
+void test_RLDH(){
+    int64_t a[N] = {0};
+    generate_random_poly(a);
+    
+    precomputed_a_t precomputed;
+    precompute_a_ntt(a, &precomputed);
+
+    int64_t s[N] = {0}, b[N] = {0};
+    int64_t s1[N] = {0}, b1[N] = {0}, htb[N] = {0}, dha[N] = {0}, dhb[N] = {0};
+    keygen(&precomputed, s, b);
+    keygen(&precomputed, s1, b1);
+    uint64_t total_cycles = 0;
+    uint64_t total_cycles1 = 0;
+    for (int i = 0; i < 1000; i++) {
+        uint64_t start = rdtsc();
+        astRLDH(b, s1, htb, dhb);
+        uint64_t end = rdtsc();
+        total_cycles += (end - start);
+        start = rdtsc();
+        recRLDH(b1, s, htb, dha);        
+        end = rdtsc();
+        total_cycles1 += (end - start);
+        for(int j = 0; j < N; j++){
+            if(dha[j] != dhb[j]){
+                printf("Reconciliation failed\n");
+                return;
+            }
+        }
+    }
+    printf("Average AstRLDH cycles: %.2f\n", (double)total_cycles / 1000);
+    printf("Average AstRLDH cycles: %.3f Mcycles\n", (double)total_cycles / 1000 / 1e6);
+    printf("Average RecRLDH cycles: %.2f\n", (double)total_cycles1 / 1000);
+    printf("Average RecRLDH cycles: %.3f Mcycles\n", (double)total_cycles1 / 1000 / 1e6);
+}
+
+void test_dh_keygen() {
+    
+    int64_t a[N]={0};
     generate_random_poly(a);
     
     precomputed_a_t precomputed;  // Use stack memory
     precompute_a_ntt(a, &precomputed);
     
-    int64_t lpk_a[N], lsk_b[N], lpk_b[N], lsk_a[N];
-    int64_t epk_a[N], esk_a[N], epk_b[N], esk_b[N];
-    int64_t spk_a[N], ssk_a[N];
-    int64_t htb[N], dhb[N], dha[N];
-    int64_t sum_sk_a[N], sum_pk_a[N], sum_sk_b[N], sum_pk_b[N];
+    int64_t lpk_a[N]={0}, lsk_b[N]={0}, lpk_b[N]={0}, lsk_a[N]={0};
+    int64_t epk_a[N]={0}, esk_a[N]={0}, epk_b[N]={0}, esk_b[N]={0};
+    int64_t spk_a[N]={0}, ssk_a[N]={0};
+    int64_t htb[N]={0}, dhb[N]={0}, dha[N]={0};
+    int64_t sum_sk_a[N]={0}, sum_pk_a[N]={0}, sum_sk_b[N]={0}, sum_pk_b[N]={0};
     
     // Generate various key pairs
     keygen(&precomputed, lsk_a, lpk_a);
     keygen(&precomputed, lsk_b, lpk_b);
     keygen(&precomputed, ssk_a, spk_a);
     
-    uint8_t seed_a[32], seed_b[32];
+    uint8_t seed_a[32]={0}, seed_b[32]={0};
     if (batched_secure_random(seed_a, 32) != SUCCESS ||
         batched_secure_random(seed_b, 32) != SUCCESS) {
         fprintf(stderr, "Random generation failed!\n");
@@ -924,26 +891,25 @@ void test_dh_keygen() {
     // RLDH protocol
     astRLDH(sum_pk_a, sum_sk_b, htb, dhb);
     recRLDH(sum_pk_b, sum_sk_a, htb, dha);
-    
-    // SID
+    // SID 
     size_t sid_size = 2 + 4 * COMPRESSED_POLY_SIZE;
     uint8_t sid[sid_size];
     
     size_t sid_len = build_session_id(lpk_a, spk_a, epk_a, sum_pk_b, sid);
     
     // KDF
-    uint8_t k[32], k0[32];
+    uint8_t k[32]={0}, k0[32]={0};
     PRF_2(dhb, sid, sid_len, k, k0);
     
     // Verification process
-    uint8_t sd_prime[32];
+    uint8_t sd_prime[32]={0};
     if (batched_secure_random(sd_prime, 32) != SUCCESS) {
         fprintf(stderr, "Random generation failed for sd_prime!\n");
         return;
     }
     
   // Step 1: compute h = SHAKE256(lpk_b + sd')
-    uint8_t h[32];
+    uint8_t h[32]={0};
     EVP_MD_CTX *shake_ctx = EVP_MD_CTX_new();
     EVP_DigestInit_ex(shake_ctx, EVP_shake256(), NULL);
     
@@ -981,10 +947,10 @@ void test_dh_keygen() {
     }
     
     // Use k0 as AES key for encryption
-    int encrypt_success = aes_gcm_encrypt(k0, 32, iv, 12, 
+    int encrypt_success = aes_gcm_encrypt(k0, 32, iv, 
                                          NULL, 0,  // No AAD
                                          plaintext, plaintext_len,
-                                         ciphertext, ciphertext_len);
+                                         ciphertext);
     
     if (!encrypt_success) {
         fprintf(stderr, "AES-GCM encryption failed\n");
@@ -994,7 +960,7 @@ void test_dh_keygen() {
     }
     
     // Step 4: Decrypt with k0
-    uint8_t k_prime[32], k0_prime[32];
+    uint8_t k_prime[32]={0}, k0_prime[32]={0};
     PRF_2(dha, sid, sid_len, k_prime, k0_prime);
     uint8_t *decrypted = malloc(plaintext_len);
     if (!decrypted) {
@@ -1005,10 +971,10 @@ void test_dh_keygen() {
     }
 
     // Note: ciphertext parameter const qualifier removed here
-    int decrypt_success = aes_gcm_decrypt(k0_prime, 32, iv, 12,
+    int decrypt_success = aes_gcm_decrypt(k0_prime, 32, iv,
                                         NULL, 0,
                                         ciphertext, ciphertext_len,  
-                                        decrypted, plaintext_len);    
+                                        decrypted);    
     if (!decrypt_success) {
         fprintf(stderr, "AES-GCM decryption failed\n");
         free(plaintext);
@@ -1017,19 +983,19 @@ void test_dh_keygen() {
         return;
     }
    // Step 5: separate sd and sd'
-    uint8_t decrypted_h[32], decrypted_sd[32], decrypted_sd_prime[32];
+    uint8_t decrypted_h[32]={0}, decrypted_sd[32]={0}, decrypted_sd_prime[32]={0};
     memcpy(decrypted_h, decrypted, 32);
     memcpy(decrypted_sd, decrypted + 32, 32);
     memcpy(decrypted_sd_prime, decrypted + 64, 32);
     
     // Step 6: recover lpk_b' = sum_pk_b - epk_b
-    int64_t s_b_recovered[N], b_b_recovered[N];
+    int64_t s_b_recovered[N]={0}, b_b_recovered[N]={0};
     generate_s_b_gaussian_optimized(decrypted_sd, &precomputed, s_b_recovered, b_b_recovered);
-    int64_t lpk_b_recovered[N];
+    int64_t lpk_b_recovered[N]={0};
     poly_sub_q(sum_pk_b, b_b_recovered, lpk_b_recovered);
     
     // Step 7: verify h = SHAKE256(lpk_b' + sd')
-    uint8_t h_verified[32];
+    uint8_t h_verified[32]={0};
     EVP_MD_CTX *verify_ctx = EVP_MD_CTX_new();
     EVP_DigestInit_ex(verify_ctx, EVP_shake256(), NULL);
     
@@ -1052,62 +1018,6 @@ void test_dh_keygen() {
     free(decrypted);
 }
 
-void test_keygen() {
-    // srand(time(NULL));
-    int64_t a[N];
-    generate_random_poly(a);
-    
-    precomputed_a_t precomputed;
-    precompute_a_ntt(a, &precomputed);
-
-    int64_t s[N], b[N];
-    uint64_t total_cycles = 0;
-    for (int i = 0; i < 1000; i++) {
-        uint64_t start = rdtsc();
-        keygen(&precomputed, s, b);
-        uint64_t end = rdtsc();
-        total_cycles += (end - start);
-    }
-    
-    printf("Average keygen cycles: %.2f\n", (double)total_cycles / 1000);
-    printf("Average keygen cycles: %.3f Mcycles\n", (double)total_cycles / 1000 / 1e6);
-}
-
-void test_RLDH(){
-    int64_t a[N];
-    generate_random_poly(a);
-    
-    precomputed_a_t precomputed;
-    precompute_a_ntt(a, &precomputed);
-
-    int64_t s[N], b[N];
-    int64_t s1[N], b1[N], htb[N],dha[N],dhb[N];
-    keygen(&precomputed, s, b);
-    keygen(&precomputed, s1, b1);
-    uint64_t total_cycles = 0;
-    uint64_t total_cycles1 = 0;
-    for (int i = 0; i < 1000; i++) {
-        uint64_t start = rdtsc();
-        astRLDH(b, s1, htb, dhb);
-        uint64_t end = rdtsc();
-        total_cycles += (end - start);
-        start = rdtsc();
-        recRLDH(b1, s, htb, dha);        
-        end = rdtsc();
-        total_cycles1 += (end - start);
-        for(int j=0;j<N;j++){
-            if(dha[j]!=dhb[j]){
-                printf("Reconciliation failed\n");
-                return;
-            }
-        }
-    }
-    printf("Average AstRLDH cycles: %.2f\n", (double)total_cycles / 1000);
-    printf("Average AstRLDH cycles: %.3f Mcycles\n", (double)total_cycles / 1000 / 1e6);
-    printf("Average RecRLDH cycles: %.2f\n", (double)total_cycles1 / 1000);
-    printf("Average RecRLDH cycles: %.3f Mcycles\n", (double)total_cycles1 / 1000 / 1e6);
-}
-
 void test_BXDH() {
     // srand(time(NULL));
     printf("Initializing B-XDH system...\n");
@@ -1126,7 +1036,7 @@ void test_BXDH() {
 
     printf("Average B-XDH time: %.3f Mcycles (%.0f cycles)\n",
            avg_mcycles, avg_cycles);  
-} 
+}
 
 int main() {
     // precompute
@@ -1135,7 +1045,8 @@ int main() {
     test_keygen();
     test_RLDH();
     test_BXDH();
+    // test_BX3DH_optimized();
+    // test_dh_keygen();
     printf("All tests passed successfully!\n");
-    // test_primitive_root();
     return 0;
 }
