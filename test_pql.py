@@ -10,9 +10,10 @@ params = LWEest(
      n=N,
      q=Q,#1280,256 bit
      Xs=ND.CenteredBinomial(etas), # s
-     Xe=ND.DiscreteGassuian(sig), # 2e
+     Xe=ND.DiscreteGaussian(sig), # 2e
      m=N,
      tag="example"
 )
 r=LWE.estimate(params)
+
 
