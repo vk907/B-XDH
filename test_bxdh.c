@@ -391,7 +391,7 @@ int shake256(const uint8_t *input, size_t input_len,
 }
 
 // CBD implementation for eta=2
-void cbd_eta(const uint8_t *buf, int64_t *r) {
+void cbd_eta2(const uint8_t *buf, int64_t *r) {
     for (int i = 0; i < N / 8; i++) {
         uint64_t t = 0;
         // Read 4 bytes (8 coefficients = 32 bits)
@@ -407,6 +407,28 @@ void cbd_eta(const uint8_t *buf, int64_t *r) {
             uint64_t a = (d >> (4 * j)) & 0x3;      // bits 0-1
             uint64_t b = (d >> (4 * j + 2)) & 0x3;  // bits 2-3
             r[8 * i + j] = (int64_t)(a - b);
+        }
+    }
+}
+
+// CBD implementation for eta=4
+void cbd_eta(const uint8_t *buf, int64_t *r) {
+    for (int i = 0; i < N / 8; i++) {
+        uint64_t t = 0;
+        // read 8 bytes = 8 coffs
+        for (int j = 0; j < 8; j++)
+            t |= ((uint64_t)buf[8*i + j]) << (8*j);
+
+        // Kyber-style bit slicing
+        uint64_t d = t & 0x1111111111111111ULL;          // Let bit positions {0,4,8,...,60}
+        d += (t >> 1) & 0x1111111111111111ULL;
+        d += (t >> 2) & 0x1111111111111111ULL;
+        d += (t >> 3) & 0x1111111111111111ULL;
+
+        for (int j = 0; j < 8; j++) {
+            uint64_t a = (d >> (8*j)) & 0xF;      // Low 4bit = a
+            uint64_t b = (d >> (8*j + 4)) & 0xF;  // High 4bit = b
+            r[8*i + j] = (int64_t)(a - b);
         }
     }
 }
@@ -1050,4 +1072,5 @@ int main() {
     printf("All tests passed successfully!\n");
     return 0;
 }
+
 
