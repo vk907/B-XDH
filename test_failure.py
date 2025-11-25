@@ -289,4 +289,4 @@ if not required_condition:
     print(f"Requirement: 12289, 18433, 40961")
 else:
     print(f"Rest: {q/4 - f_final}")
-print(log(tail_probability(diff,f_final), 2))
+print(log(tail_probability(diff,q/4-2), 2))
