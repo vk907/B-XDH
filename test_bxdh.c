@@ -12,7 +12,7 @@
 #define Q 18433
 #define ROOT 5
 #define LOGN 9
-#define ETA 2
+#define ETA 4
 #define BITS_PER_COEFF 14
 #define COMPRESSED_POLY_SIZE ((N * BITS_PER_COEFF + 7) / 8)
 #define BARRETT_SHIFT 48
@@ -1050,3 +1050,4 @@ int main() {
     printf("All tests passed successfully!\n");
     return 0;
 }
+
