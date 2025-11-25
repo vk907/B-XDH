@@ -253,7 +253,7 @@ E_jT_S_i_x2 = multiply_distribution(E_jT_S_i, 2)  # 2E_jᵀS_i
 
 
 # target_prob = 1e-85 / min(n, 256)
-target_prob = 2**(-155) / min(n, 256)
+target_prob = 2**(-128) / min(n, 256)
 
 print("Final Noise...")
 
