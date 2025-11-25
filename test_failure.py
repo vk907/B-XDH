@@ -190,10 +190,9 @@ import math
 from math import log
 
 bitsec = 128
-(n, k) = (768, 1)  # n=256维多项式，k=2维
+(n, k) = (512, 1) 
 
 def build_centered_binomial(param):
-    """构建中心二项分布ψ_param"""
     D = {}
     for i in range(-param, param+1):
         if abs(i) <= param:
@@ -204,51 +203,50 @@ def build_centered_binomial(param):
     return D
 
 def multiply_distribution(D, factor):
-    """将分布D乘以系数factor"""
+    """Multiply factor"""
     new_D = {}
     for x, prob in D.items():
         new_x = factor * x
         new_D[new_x] = new_D.get(new_x, 0) + prob
     return new_D
 
-# 构建分布
-CBD3 = build_centered_binomial(2)  # S_j, S_i, E_i 的系数分布
-CBD2 = build_centered_binomial(2)  # E_j 的系数分布
 
-print("构建基础分布...")
+CBD3 = build_centered_binomial(4)  # S_j, S_i, E_i 
+CBD2 = build_centered_binomial(4)  # E_j
 
-# 计算 S_j = sj0 + sj1 + sj2 的分布
+print("Basic Distribution...")
+
+# S_j = sj0 + sj1 
 S_j = CBD3
 for _ in range(1):
     S_j = law_convolution(S_j, CBD3)
     S_j = clean_dist(S_j)
 
-# 计算 E_i = ei0 + ei1 + ei2 的分布
+# E_i = ei0 + ei1 + ei2
 E_i = CBD3
 for _ in range(2):
     E_i = law_convolution(E_i, CBD3)
     E_i = clean_dist(E_i)
 
-# 计算 S_i = si0 + si1 + si2 的分布
+# S_i = si0 + si1 + si2
 S_i = CBD3
 for _ in range(2):
     S_i = law_convolution(S_i, CBD3)
     S_i = clean_dist(S_i)
 
-# 计算 E_j = ej0 + ej1 + ej2 的分布
+# E_j = ej0 + ej1 
 E_j = CBD2
 for _ in range(1):
     E_j = law_convolution(E_j, CBD2)
     E_j = clean_dist(E_j)
 
-print("计算乘积项并乘以系数2...")
 
-# 计算 S_jᵀE_i 并乘以2
+# 2S_jᵀE_i
 S_jT_E_i = law_product(S_j, E_i)
 S_jT_E_i = clean_dist(S_jT_E_i)
 S_jT_E_i_x2 = multiply_distribution(S_jT_E_i, 2)  # 2S_jᵀE_i
 
-# 计算 E_jᵀS_i 并乘以2
+# 2E_jᵀS_i
 E_jT_S_i = law_product(E_j, S_i)
 E_jT_S_i = clean_dist(E_jT_S_i)
 E_jT_S_i_x2 = multiply_distribution(E_jT_S_i, 2)  # 2E_jᵀS_i
@@ -257,37 +255,38 @@ E_jT_S_i_x2 = multiply_distribution(E_jT_S_i, 2)  # 2E_jᵀS_i
 # target_prob = 1e-85 / min(n, 256)
 target_prob = 2**(-155) / min(n, 256)
 
-print("计算最终噪声分布...")
+print("Final Noise...")
 
-# 计算 n*k 次卷积（k维n阶多项式）
+# n*k of single 2si*ej
 S_jT_E_i_sum = iter_law_convolution(S_jT_E_i_x2, n * k)
 E_jT_S_i_sum = iter_law_convolution(E_jT_S_i_x2, n * k)
 
-# 计算 2S_jᵀE_i - 2E_jᵀS_i
+# final 2S_jᵀE_i - 2E_jᵀS_i
 diff = law_convolution(S_jT_E_i_sum, {-x: p for x, p in E_jT_S_i_sum.items()})
 diff = clean_dist(diff)
 
+# 2y
 E=multiply_distribution(CBD2, 2)
 E = clean_dist(E)
 En=iter_law_convolution(E, n)
 En = clean_dist(En)
+# final 2S_jᵀE_i - 2E_jᵀS_i+2y
 diff = law_convolution(diff, En)
 diff = clean_dist(diff)
 
-print("计算最终错误率...")
+print("Calculate final...")
 
-# 计算最终尾部边界
+# tail-bound
 f_final = find_tail_for_probability(diff, target_prob)
-print(f"最终尾部边界 (2S_jᵀE_i - 2E_jᵀS_i): {f_final} or, 2^{log(f_final, 2)}")
+print(f"Final tail bound (2S_jᵀE_i - 2E_jᵀS_i): {f_final} or, 2^{log(f_final, 2)}")
 
-# 验证是否满足q=3329
-q = 12289
+# set q
+q = 18433
 required_condition = q > 4 * f_final
-print(f"q=15631是否足够: {required_condition}")
+print(f"q=18433 enough: {required_condition}")
 if not required_condition:
-    print(f"需要的最小q: {4 * f_final}")
-    print(f"推荐模数: 12289, 18433, 40961")
+    print(f"Necessary q: {4 * f_final}")
+    print(f"Requirement: 12289, 18433, 40961")
 else:
-    print(f"安全余量: {q/4 - f_final}")
+    print(f"Rest: {q/4 - f_final}")
 print(log(tail_probability(diff,f_final), 2))
-print(log(n*tail_probability(diff,f_final), 2))
