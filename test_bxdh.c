@@ -701,25 +701,6 @@ size_t build_session_id(const int64_t lpk_a[N], const int64_t spk_a[N],
     return offset;
 }
 
-size_t build_session_id1(const int64_t sum_pk_a[N], const int64_t sum_pk_b[N],
-                       uint8_t *sid_output) {
-    size_t offset = 0;
-    
-    memcpy(sid_output + offset, "A", 1);
-    offset += 1;
-    
-    memcpy(sid_output + offset, "B", 1);
-    offset += 1;
-    
-    poly_to_compressed_bytes(sum_pk_a, N, sid_output + offset);
-    offset += COMPRESSED_POLY_SIZE;
-    
-    poly_to_compressed_bytes(sum_pk_b, N, sid_output + offset);
-    offset += COMPRESSED_POLY_SIZE;
-    
-    return offset;
-}
-
 // ==================== AES-GCM encryption/decryption ====================
 
 int aes_gcm_encrypt(const uint8_t *key, size_t key_len,
@@ -1072,5 +1053,6 @@ int main() {
     printf("All tests passed successfully!\n");
     return 0;
 }
+
 
 
