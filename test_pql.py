@@ -16,4 +16,10 @@ params = LWEest(
 )
 r=LWE.estimate(params)
 
-
+"""
+bkw                  :: rop: ≈2^180.9, m: ≈2^166.0, mem: ≈2^160.1, b: 11, t1: 0, t2: 19, ℓ: 10, #cod: 453, #top: 3, #test: 56, tag: coded-bkw
+usvp                 :: rop: ≈2^132.3, red: ≈2^132.3, δ: 1.004250, β: 364, d: 1020, tag: usvp
+bdd                  :: rop: ≈2^129.2, red: ≈2^128.1, svp: ≈2^128.2, β: 349, η: 383, d: 1015, tag: bdd
+dual                 :: rop: ≈2^137.3, mem: ≈2^88.1, m: 512, β: 379, d: 1024, ↻: 1, tag: dual
+dual_hybrid          :: rop: ≈2^129.1, red: ≈2^129.0, guess: ≈2^125.5, β: 349, p: 6, ζ: 10, t: 30, β': 355, N: ≈2^73.5, m: 512
+"""
